@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epub-normalize-fonts"
-version = "2.0.0"
-description = "Make EPUB books follow your e-reader's font and size settings"
+version = "2.2.0"
+description = "Make EPUB books follow your e-reader's font, size and line spacing settings"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import unquote
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 
 # Text is decoded with surrogateescape so bytes we don't touch round-trip exactly,
 # even if a file is not valid UTF-8.
@@ -128,6 +128,10 @@ class Report:
     declarations: int = 0
     sizes_converted: int = 0
     size_decls_removed: int = 0
+    sizes_rescaled: int = 0
+    line_heights_removed: int = 0
+    paragraphs_changed: int = 0
+    first_paragraphs: int = 0
     body_before: float | None = None
     body_after: float | None = None
     changed_files: set[str] = field(default_factory=set)
@@ -150,8 +154,20 @@ class Report:
             parts.append(f"{self.declarations} font-family declaration(s) changed")
         if self.sizes_converted:
             parts.append(f"{self.sizes_converted} fixed font size(s) made relative")
-        if self.size_decls_removed and self.body_before is not None:
-            parts.append(f"body text {self.body_before:.0%} -> {self.body_after:.0%}")
+        if self.size_decls_removed:
+            text = f"{self.size_decls_removed} body text font-size declaration(s) removed"
+            if self.body_before is not None and abs(self.body_before - 1) > 0.005:
+                text += f" (body text was {self.body_before:.0%})"
+            parts.append(text)
+        if self.sizes_rescaled:
+            parts.append(f"{self.sizes_rescaled} other font size(s) rescaled to match")
+        if self.line_heights_removed:
+            parts.append(f"{self.line_heights_removed} line-height declaration(s) removed")
+        if self.paragraphs_changed:
+            text = f"{self.paragraphs_changed} paragraph(s) restyled"
+            if self.first_paragraphs:
+                text += f" ({self.first_paragraphs} set flush left)"
+            parts.append(text)
         return ", ".join(parts) or "updated metadata"
 
 
@@ -356,7 +372,6 @@ NUM_UNIT_RE = re.compile(r"([+-]?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)", re.I)
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
              "source", "track", "wbr"}
 NO_TEXT_TAGS = {"head", "style", "script", "title"}
-BODY_TOLERANCE = 0.03   # body text within 3% of the default counts as standard
 SAME_SIZE_BAND = 0.08   # text within 8% of the dominant size is treated as body text
 MIN_BODY_CHARS = 200
 
@@ -409,13 +424,43 @@ def resolve_size(value: str, parent: float) -> tuple[float, bool] | None:
     return None  # inherit, calc(), viewport units, ...
 
 
-def last_size_decl(block: str) -> tuple[str, bool] | None:
-    best = None
-    for m in FONT_SIZE_DECL_RE.finditer(block):
+# Declarations the analysis follows through the cascade.
+TRACKED_PROPS = {"font-size", "line-height", "text-align", "text-indent", "margin-top", "margin-bottom"}
+DECL_ANY_RE = re.compile(
+    r"(?<![\w-])(?P<prop>-?[a-z][\w-]*)\s*:\s*"
+    r"(?P<value>(?:\"[^\"]*\"|'[^']*'|\([^)]*\)|[^;{}\"'(])*)",
+    re.I,
+)
+LINE_HEIGHT_DECL_RE = decl_re("line-height")
+NON_TEXT_RE = re.compile(r"\s+|&nbsp;|&#160;|&#xa0;|\xa0", re.I)
+BLOCK_TAGS = {"p", "div"}
+BODY_ALIGN = {"", "left", "justify", "start", "auto"}  # alignments of ordinary body paragraphs
+PARA_SHARE = 0.02  # a paragraph style must hold 2% of the body text to count as body paragraphs
+
+
+def parse_decls(block: str) -> dict[str, tuple[str, bool]]:
+    """Tracked declarations of a block as {property: (value, important)}; later ones win.
+
+    The ``margin`` shorthand is split into margin-top and margin-bottom.
+    """
+    out: dict[str, tuple[str, bool]] = {}
+    for m in DECL_ANY_RE.finditer(block):
+        prop = m.group("prop").lower()
         core, important = split_important(m.group("value"))
-        if important or not (best and best[1]):
-            best = (core.strip(), important)
-    return best
+        core = core.strip()
+        if prop == "margin":
+            parts = core.split()
+            if not 1 <= len(parts) <= 4:
+                continue
+            items = [("margin-top", parts[0]), ("margin-bottom", parts[2] if len(parts) > 2 else parts[0])]
+        elif prop in TRACKED_PROPS:
+            items = [(prop, core)]
+        else:
+            continue
+        for p, v in items:
+            if important or not (p in out and out[p][1]):
+                out[p] = (v, important)
+    return out
 
 
 # Selectors: only type/class/id compounds with descendant and child combinators are
@@ -424,14 +469,13 @@ Compound = tuple  # (tag or "*", frozenset(classes), id or None)
 COMPOUND_RE = re.compile(r"(\*|[a-z][\w-]*)?((?:[.#][\w-]+)*)", re.I)
 
 
-class SizeRule(NamedTuple):
-    important: bool
+class Rule(NamedTuple):
     spec: tuple
     order: int
-    value: str
     rule_id: tuple
     comps: list
     combs: list
+    decls: dict
 
 
 def parse_compound(tok: str) -> Compound | None:
@@ -503,12 +547,12 @@ def parse_sheet(css: str) -> list:
     for idx, sel, (s, e) in iter_rules(css):
         if sel.startswith("@"):
             continue
-        decl = last_size_decl(css[s:e])
-        if not decl:
+        decls = parse_decls(css[s:e])
+        if not decls:
             continue
         sels = [p for p in (parse_selector(x) for x in sel.split(",")) if p]
         if sels:
-            out.append((idx, sels, decl[0], decl[1]))
+            out.append((idx, sels, decls))
     return out
 
 
@@ -540,57 +584,119 @@ def doc_sheets(doc: str, texts: dict[str, str]) -> list[tuple[tuple, str]]:
     return out
 
 
-def build_index(sheets: list, cache: dict) -> dict[str, list[SizeRule]]:
-    index: dict[str, list[SizeRule]] = defaultdict(list)
+def build_index(sheets: list, cache: dict) -> dict[str, list[Rule]]:
+    index: dict[str, list[Rule]] = defaultdict(list)
     order = 0
-    for key, css in sheets:
-        if key not in cache:
-            cache[key] = parse_sheet(css)
-        for idx, sels, value, important in cache[key]:
+    for source_key, css in sheets:
+        if source_key not in cache:
+            cache[source_key] = parse_sheet(css)
+        for idx, sels, decls in cache[source_key]:
             for comps, combs, spec in sels:
                 order += 1
                 index[index_key(comps[-1])].append(
-                    SizeRule(important, spec, order, value, ("rule", key, idx), comps, combs)
+                    Rule(spec, order, ("rule", source_key, idx), comps, combs, decls)
                 )
     return index
 
 
-@dataclass
-class SizeStats:
-    chars: Counter = field(default_factory=Counter)
-    ids: dict = field(default_factory=lambda: defaultdict(set))
-
-
-def element_size(el, ancestors, style, parent, parent_chain, index, inline_id):
-    """Compute an element's font size (relative to root) and the sources that shaped it."""
+def cascade(el: Compound, ancestors: list, style: str | None, index: dict, inline_id: tuple) -> dict:
+    """The winning declaration of each tracked property, as {property: (value, source)}."""
     keys = ["*", el[0], *("." + c for c in el[1])] + (["#" + el[2]] if el[2] else [])
-    best = None
+    best: dict[str, tuple] = {}
     for k in keys:
         for r in index.get(k, ()):
-            if (best is None or (r.important, r.spec, r.order) > (best.important, best.spec, best.order)) \
-                    and sel_matches(r.comps, r.combs, el, ancestors):
-                best = r
-    value, source = (best.value, best.rule_id) if best else (None, None)
+            if not sel_matches(r.comps, r.combs, el, ancestors):
+                continue
+            for prop, (value, important) in r.decls.items():
+                rank = (important, r.spec, r.order)
+                if prop not in best or rank > best[prop][0]:
+                    best[prop] = (rank, value, r.rule_id)
     if style:
-        inline = last_size_decl(unescape_attr(style))
-        if inline and (not best or not best.important or inline[1]):
-            value, source = inline[0], inline_id
+        for prop, (value, important) in parse_decls(unescape_attr(style)).items():
+            if prop not in best or important or not best[prop][0][0]:
+                best[prop] = ((important, (9, 9, 9), 0), value, inline_id)
+    return {prop: (value, source) for prop, (_, value, source) in best.items()}
 
+
+def inherited(win: dict, prop: str, parent_value: str) -> str:
+    decl = win.get(prop)
+    if decl is None or decl[0].lower() in ("inherit", "unset"):
+        return parent_value
+    return decl[0].lower()
+
+
+class Node:
+    """An element as seen by the analysis."""
+
+    __slots__ = ("doc", "ordinal", "tag", "el", "sig", "size", "chain", "adjust", "align",
+                 "indent", "margin_top", "margin_bottom", "lh", "prev", "last_child", "chars")
+
+
+@dataclass
+class SizeStats:
+    chars: Counter = field(default_factory=Counter)     # bucket -> characters of text
+    weighted: Counter = field(default_factory=Counter)  # bucket -> sum of exact size x chars
+    ids: dict = field(default_factory=lambda: defaultdict(set))     # bucket -> size sources
+    lh_ids: dict = field(default_factory=lambda: defaultdict(set))  # bucket -> line-height sources
+    blocks: list = field(default_factory=list)  # p and div Nodes
+
+
+@dataclass
+class SizePlan:
+    """A planned change: the size sources to remove and the current body text size.
+
+    While the plan is analyzed, ``factors`` collects, for every other relative size source,
+    the factor it must be scaled by to keep its size relative to the body text.
+    """
+
+    removed: set
+    body: float
+    factors: dict = field(default_factory=lambda: defaultdict(Counter))
+
+
+def element_size(win: dict, tag: str, parent: float, parent_chain: tuple):
+    """Compute an element's font size relative to the root.
+
+    Returns (size, chain, source, ratio). ``chain`` holds the (source, factor) pairs of the
+    non-neutral size declarations that shaped the size, ``source`` is the declaration that
+    set the element's own size (None if inherited) and ``ratio`` is size / parent for
+    relative values (None for absolute ones).
+    """
+    value, source = win.get("font-size", (None, None))
     if value is None:
-        return parent * UA_SIZES.get(el[0], 1.0), parent_chain
+        return parent * UA_SIZES.get(tag, 1.0), parent_chain, None, None
     res = resolve_size(value, parent)
     if res is None:
-        return parent, parent_chain
+        return parent, parent_chain, None, None
     size, absolute = res
     if absolute:
-        return size, (() if abs(size - 1) < 1e-6 else (source,))
-    if abs(size - parent) < 1e-9:
-        return size, parent_chain
-    return size, parent_chain + (source,)
+        return size, (() if abs(size - 1) < 1e-6 else ((source, size),)), source, None
+    ratio = size / parent if parent else 1.0
+    chain = parent_chain if abs(ratio - 1) < 1e-9 else parent_chain + ((source, ratio),)
+    return size, chain, source, ratio
 
 
-def analyze_doc(doc: str, html: str, index: dict, stats: SizeStats) -> None:
-    stack: list[tuple] = []  # (tag, element, size, chain)
+def plan_adjust(plan: SizePlan, source, ratio, size: float, parent: float, adjust: float) -> float:
+    """Return new size / old size for an element once ``plan`` is applied.
+
+    ``adjust`` is that value for the element's parent. Relative sources that are not removed
+    are recorded with the factor that keeps them at the same size relative to the body text.
+    """
+    if source is None:
+        return adjust
+    if source in plan.removed:
+        # The declaration goes away, so the element inherits its parent's new size.
+        return adjust * parent / size if size else adjust
+    if ratio is None:
+        return 1.0  # absolute sizes are left as they are
+    factor = 1 / (adjust * plan.body)
+    plan.factors[source][round(factor, 4)] += 1
+    return 1 / plan.body
+
+
+def analyze_doc(doc: str, html: str, index: dict, stats: SizeStats, plan: SizePlan | None = None) -> None:
+    stack: list[Node] = []
+    top_last: Node | None = None  # last top-level element, for sibling tracking
     ordinal = -1
     for m in TOKEN_RE.finditer(html):
         end_tag, start_tag = m.group(1), m.group(2)
@@ -599,31 +705,61 @@ def analyze_doc(doc: str, html: str, index: dict, stats: SizeStats) -> None:
             tag = start_tag.rsplit(":", 1)[-1].lower()
             a = attrs(m.group(3))
             el = (tag, frozenset(a.get("class", "").split()), a.get("id"))
-            parent, chain = (stack[-1][2], stack[-1][3]) if stack else (1.0, ())
-            size, chain = element_size(
-                el, [s[1] for s in stack], a.get("style"), parent, chain, index,
-                ("inline", doc, ordinal),
-            )
+            parent = stack[-1] if stack else None
+            win = cascade(el, [s.el for s in stack], a.get("style"), index, ("inline", doc, ordinal))
+            psize, pchain, padjust = (parent.size, parent.chain, parent.adjust) if parent else (1.0, (), 1.0)
+
+            node = Node()
+            node.doc, node.ordinal, node.tag, node.el = doc, ordinal, tag, el
+            node.size, node.chain, source, ratio = element_size(win, tag, psize, pchain)
+            node.adjust = plan_adjust(plan, source, ratio, node.size, psize, padjust) if plan else padjust
+            node.align = inherited(win, "text-align", parent.align if parent else "")
+            node.indent = inherited(win, "text-indent", parent.indent if parent else "0")
+            node.margin_top = win["margin-top"][0] if "margin-top" in win else None
+            node.margin_bottom = win["margin-bottom"][0] if "margin-bottom" in win else None
+            lh = win.get("line-height")
+            if lh is None or lh[0].lower() in ("inherit", "unset"):
+                node.lh = parent.lh if parent else None
+            elif lh[0].lower() in ("normal", "initial"):
+                node.lh = None
+            else:
+                node.lh = lh[1]
+            node.sig = (tag, el[1], (parent.tag, parent.el[1]) if parent else None)
+            node.prev = parent.last_child if parent else top_last
+            node.last_child, node.chars = None, 0
+            if parent:
+                parent.last_child = node
+            else:
+                top_last = node
+            if tag in BLOCK_TAGS:
+                stats.blocks.append(node)
             if not (m.group(3).rstrip().endswith("/") or tag in VOID_TAGS):
-                stack.append((tag, el, size, chain))
+                stack.append(node)
         elif end_tag:
             tag = end_tag.rsplit(":", 1)[-1].lower()
             for i in range(len(stack) - 1, -1, -1):
-                if stack[i][0] == tag:
+                if stack[i].tag == tag:
                     del stack[i:]
                     break
         elif stack and not m.group(0).startswith("<"):
-            tags = {s[0] for s in stack}
+            tags = {s.tag for s in stack}
             if "body" not in tags or tags & NO_TEXT_TAGS:
                 continue
-            n = len("".join(m.group(0).split()))
+            n = len(NON_TEXT_RE.sub("", m.group(0)))
             if n:
-                bucket = round(stack[-1][2], 2)
+                node = stack[-1]
+                bucket = round(node.size, 2)
                 stats.chars[bucket] += n
-                stats.ids[bucket].update(stack[-1][3])
+                stats.weighted[bucket] += node.size * n
+                stats.ids[bucket].update(src for src, _ in node.chain)
+                if node.lh is not None:
+                    stats.lh_ids[bucket].add(node.lh)
+                block = next((s for s in reversed(stack) if s.tag in BLOCK_TAGS), None)
+                if block is not None:
+                    block.chars += n
 
 
-def analyze_sizes(texts: dict[str, str]) -> SizeStats:
+def analyze_sizes(texts: dict[str, str], plan: SizePlan | None = None) -> SizeStats:
     stats = SizeStats()
     sheet_cache: dict = {}
     index_cache: dict = {}
@@ -632,109 +768,288 @@ def analyze_sizes(texts: dict[str, str]) -> SizeStats:
         key = tuple(k for k, _ in sheets)
         if key not in index_cache:
             index_cache[key] = build_index(sheets, sheet_cache)
-        analyze_doc(doc, texts[doc], index_cache[key], stats)
+        analyze_doc(doc, texts[doc], index_cache[key], stats, plan)
     return stats
 
 
-def remove_rule_sizes(css: str, indices: set[int]) -> tuple[str, int]:
-    removed = 0
-    spans = [span for idx, _, span in iter_rules(css) if idx in indices]
-    for s, e in reversed(spans):
-        block, n = FONT_SIZE_DECL_RE.subn("", css[s:e])
-        removed += n
+def body_band(stats: SizeStats) -> tuple[float | None, set]:
+    """The body text size and the size buckets that count as body text."""
+    if sum(stats.chars.values()) < MIN_BODY_CHARS:
+        return None, set()
+    bucket = max(stats.chars, key=stats.chars.get)
+    d = stats.weighted[bucket] / stats.chars[bucket]
+    if d <= 0:
+        return None, set()
+    return d, {b for b in stats.chars if abs(b / d - 1) <= SAME_SIZE_BAND}
+
+
+def edit_decls(css: str, factor: float | None, pattern: re.Pattern = FONT_SIZE_DECL_RE) -> tuple[str, int]:
+    """Remove the declarations ``pattern`` matches (factor None) or scale relative font sizes."""
+    if factor is None:
+        return pattern.subn("", css)
+    count = 0
+
+    def fix(m: re.Match) -> str:
+        nonlocal count
+        core, important = split_important(m.group("value"))
+        n = NUM_UNIT_RE.fullmatch(core.strip())
+        unit = n.group(2).lower() if n else ""
+        if not n or unit not in REL_UNITS:
+            return m.group(0)
+        count += 1
+        imp = " !important" if important else ""
+        value = fmt_em(float(n.group(1)) * REL_UNITS[unit] * factor)
+        return f"{m.group('lead')}font-size: {value}{imp}{m.group('end')}"
+
+    return FONT_SIZE_DECL_RE.sub(fix, css), count
+
+
+def edit_rules(css: str, edits: dict[int, float | None], pattern: re.Pattern) -> tuple[str, int, int]:
+    removed = rescaled = 0
+    spans = [(span, edits[idx]) for idx, _, span in iter_rules(css) if idx in edits]
+    for (s, e), factor in reversed(spans):
+        block, n = edit_decls(css[s:e], factor, pattern)
+        if factor is None:
+            removed += n
+        else:
+            rescaled += n
         if not block.strip():
             block = " "
         css = css[:s] + block + css[e:]
-    return css, removed
+    return css, removed, rescaled
 
 
-def remove_size_sources(texts: dict[str, str], ids: set[tuple]) -> int:
-    css_targets: dict[str, set] = defaultdict(set)
-    style_targets: dict[str, dict] = defaultdict(lambda: defaultdict(set))
-    inline_targets: dict[str, set] = defaultdict(set)
-    for kind, key, idx in ids:
+def apply_edits(
+    texts: dict[str, str],
+    edits: dict[tuple, float | None],
+    pattern: re.Pattern = FONT_SIZE_DECL_RE,
+) -> tuple[int, int]:
+    """Remove (value None) or scale (value = factor) the declarations of the given sources.
+
+    ``pattern`` picks the property: font-size (which can also be scaled) or line-height.
+    """
+    css_targets: dict[str, dict] = defaultdict(dict)
+    style_targets: dict[str, dict] = defaultdict(lambda: defaultdict(dict))
+    inline_targets: dict[str, dict] = defaultdict(dict)
+    for (kind, key, idx), factor in edits.items():
         if kind == "inline":
-            inline_targets[key].add(idx)
+            inline_targets[key][idx] = factor
         elif key[0] == "css":
-            css_targets[key[1]].add(idx)
+            css_targets[key[1]][idx] = factor
         else:
-            style_targets[key[1]][key[2]].add(idx)
+            style_targets[key[1]][key[2]][idx] = factor
 
-    removed = 0
-    for name, indices in css_targets.items():
-        texts[name], n = remove_rule_sizes(texts[name], indices)
-        removed += n
+    removed = rescaled = 0
+    for name, rule_edits in css_targets.items():
+        texts[name], r, s = edit_rules(texts[name], rule_edits, pattern)
+        removed, rescaled = removed + r, rescaled + s
 
     for doc in set(style_targets) | set(inline_targets):
         html = texts[doc]
         blocks, k = style_targets.get(doc, {}), -1
 
         def fix_block(m: re.Match) -> str:
-            nonlocal k, removed
+            nonlocal k, removed, rescaled
             k += 1
             if k not in blocks:
                 return m.group(0)
-            css, n = remove_rule_sizes(m.group(2), blocks[k])
-            removed += n
+            css, r, s = edit_rules(m.group(2), blocks[k], pattern)
+            removed, rescaled = removed + r, rescaled + s
             return m.group(1) + css + m.group(3)
 
         html = STYLE_BLOCK_RE.sub(fix_block, html)
 
-        ordinals, counter = inline_targets.get(doc, set()), -1
-
-        def drop(css: str) -> str:
-            nonlocal removed
-            new, n = FONT_SIZE_DECL_RE.subn("", css)
-            removed += n
-            return new
+        tag_edits, counter = inline_targets.get(doc, {}), -1
 
         def fix_tag(m: re.Match) -> str:
             nonlocal counter
             if not m.group(2):
                 return m.group(0)
             counter += 1
-            return edit_style_attrs(m.group(0), drop) if counter in ordinals else m.group(0)
+            if counter not in tag_edits:
+                return m.group(0)
+            factor = tag_edits[counter]
 
-        if ordinals:
+            def edit(css: str) -> str:
+                nonlocal removed, rescaled
+                new, n = edit_decls(css, factor, pattern)
+                if factor is None:
+                    removed += n
+                else:
+                    rescaled += n
+                return new
+
+            return edit_style_attrs(m.group(0), edit)
+
+        if tag_edits:
             html = TOKEN_RE.sub(fix_tag, html)
         texts[doc] = html
-    return removed
+    return removed, rescaled
 
 
-def normalize_body_size(texts: dict[str, str]) -> tuple[int, float | None, float | None]:
-    """Make the dominant body-text size equal the reader's default size.
+def normalize_body_size(texts: dict[str, str]) -> tuple[int, int, float | None, float | None]:
+    """Make the body text the reader's default size, without depending on any size rule.
 
-    Finds the font size most of the book's text is rendered at, then removes the font-size
-    declarations responsible for it (on the text's own elements and their ancestors), so that
-    text ends up at 1em while headings, footnotes, etc. keep their own relative sizes.
-    Returns (declarations removed, body size before, body size after).
+    Finds the font size most of the book's text is rendered at and the font-size declarations
+    that produce it (on the text's own elements and their ancestors). Those are removed, even
+    when they cancel out (e.g. body 1.29em and p 0.77em): many reading apps override the body
+    size, which would leave the text at 77%. Other relative sizes (headings, notes, ...) are
+    scaled so they keep their size relative to the body text.
+    Returns (declarations removed, declarations rescaled, body size before, body size after).
     """
-
-    def dominant(stats: SizeStats) -> float | None:
-        if sum(stats.chars.values()) < MIN_BODY_CHARS:
-            return None
-        return max(stats.chars, key=stats.chars.get)
-
-    removed, before, after = 0, None, None
+    removed = rescaled = 0
+    before = after = None
     for _ in range(8):
         stats = analyze_sizes(texts)
-        d = dominant(stats)
+        d, band = body_band(stats)
         if before is None:
             before = d
         after = d
-        if d is None or d <= 0 or abs(d - 1) <= BODY_TOLERANCE:
+        if d is None:
             break
-        ids: set = set()
-        for bucket in stats.chars:
-            if abs(bucket / d - 1) <= SAME_SIZE_BAND:
-                ids |= stats.ids[bucket]
-        n = remove_size_sources(texts, ids)
-        if not n:
+        ids: set = set().union(*(stats.ids[b] for b in band))
+        if not ids:
+            break  # the body text size no longer depends on any declaration
+
+        plan = SizePlan(ids, d)
+        analyze_sizes(texts, plan)
+        edits: dict[tuple, float | None] = {i: None for i in ids}
+        for source, factors in plan.factors.items():
+            # Only rescale a rule that needs the same factor everywhere it applies.
+            factor = factors.most_common(1)[0][0]
+            if abs(factor - 1) > 0.005 and all(abs(f / factor - 1) <= 0.01 for f in factors):
+                edits[source] = factor
+        r, s = apply_edits(texts, edits)
+        if not r:
             break
-        removed += n
+        removed, rescaled = removed + r, rescaled + s
     else:
-        after = dominant(analyze_sizes(texts))
-    return removed, before, after
+        after = body_band(analyze_sizes(texts))[0]
+    return removed, rescaled, before, after
+
+
+# --------------------------------------------------------------------------- line height
+
+
+def remove_absolute_line_heights(css: str) -> tuple[str, int]:
+    """Drop line-height values in px/pt/...: they don't grow with the font size."""
+    count = 0
+
+    def fix(m: re.Match) -> str:
+        nonlocal count
+        core, _ = split_important(m.group("value"))
+        n = NUM_UNIT_RE.fullmatch(core.strip())
+        if not n or n.group(2).lower() not in ABS_UNITS or float(n.group(1)) == 0:
+            return m.group(0)
+        count += 1
+        return ""
+
+    return LINE_HEIGHT_DECL_RE.sub(fix, css), count
+
+
+def normalize_line_height(texts: dict[str, str]) -> int:
+    """Remove the line-height declarations that apply to the body text.
+
+    The reading app's line spacing setting then applies. Returns the number removed.
+    """
+    removed = 0
+    for _ in range(8):
+        stats = analyze_sizes(texts)
+        _, band = body_band(stats)
+        ids: set = set().union(*(stats.lh_ids[b] for b in band)) if band else set()
+        if not ids:
+            break
+        r, _ = apply_edits(texts, {i: None for i in ids}, LINE_HEIGHT_DECL_RE)
+        if not r:
+            break
+        removed += r
+    return removed
+
+
+# --------------------------------------------------------------------------- paragraphs
+
+_DECL_RES: dict[str, re.Pattern] = {}
+
+
+def set_inline_props(tag: str, props: dict[str, str]) -> str:
+    """Set CSS properties in a start tag's style attribute, replacing earlier values."""
+    addition = "; ".join(f"{p}: {v}" for p, v in props.items())
+    if STYLE_ATTR_RE.search(tag):
+        def fn(css: str) -> str:
+            for p in props:
+                pattern = _DECL_RES.setdefault(p, decl_re(p))
+                css = pattern.sub("", css)
+            css = css.strip().rstrip(";").strip()
+            return f"{css}; {addition}" if css else addition
+
+        return edit_style_attrs(tag, fn)
+    end = -2 if tag.endswith("/>") else -1
+    return f'{tag[:end].rstrip()} style="{addition}"{tag[end:]}'
+
+
+def is_length(value: str | None, target_em: float) -> bool:
+    """Whether a CSS length equals ``target_em`` (0 in any unit, otherwise in em)."""
+    if value is None:
+        return False
+    m = NUM_UNIT_RE.fullmatch(value.strip().lower())
+    if not m:
+        return False
+    n = float(m.group(1))
+    if n == 0:
+        return target_em == 0
+    return m.group(2) == "em" and abs(n - target_em) < 1e-6
+
+
+def normalize_paragraphs(texts: dict[str, str]) -> tuple[int, int]:
+    """Give body paragraphs the book convention: 1em indent, no space between paragraphs.
+
+    Body paragraphs are p/div elements holding body-size text that are not centered or
+    right-aligned, in a style (tag, classes, parent) that holds at least 2% of the body text,
+    so poetry, letters and the like keep their own layout. A paragraph that does not follow
+    another body paragraph (first after a heading, scene break, image, ...) is not indented.
+    Returns (paragraphs changed, of which flush-left first paragraphs).
+    """
+    stats = analyze_sizes(texts)
+    _, band = body_band(stats)
+    if not band:
+        return 0, 0
+    paras = [n for n in stats.blocks
+             if n.chars and round(n.size, 2) in band and n.align in BODY_ALIGN]
+    sig_chars: Counter = Counter()
+    for n in paras:
+        sig_chars[n.sig] += n.chars
+    total = sum(sig_chars.values())
+    body = {id(n) for n in paras if sig_chars[n.sig] >= PARA_SHARE * total}
+
+    edits: dict[str, dict[int, dict]] = defaultdict(dict)
+    firsts = 0
+    for n in paras:
+        if id(n) not in body:
+            continue
+        first = n.prev is None or id(n.prev) not in body
+        needs = {}
+        if not (is_length(n.indent, 0.0 if first else 1.0) or (first and n.indent == "")):
+            needs["text-indent"] = "0" if first else "1em"
+        for prop, value in (("margin-top", n.margin_top), ("margin-bottom", n.margin_bottom)):
+            if not (is_length(value, 0.0) or (value is None and n.tag == "div")):
+                needs[prop] = "0"
+        if needs:
+            edits[n.doc][n.ordinal] = needs
+            firsts += first and "text-indent" in needs
+
+    for doc, tag_edits in edits.items():
+        counter = -1
+
+        def fix(m: re.Match) -> str:
+            nonlocal counter
+            if not m.group(2):
+                return m.group(0)
+            counter += 1
+            props = tag_edits.get(counter)
+            return set_inline_props(m.group(0), props) if props else m.group(0)
+
+        texts[doc] = TOKEN_RE.sub(fix, texts[doc])
+    return sum(len(e) for e in edits.values()), firsts
 
 
 # --------------------------------------------------------------------------- EPUB
@@ -812,7 +1127,8 @@ def normalize_epub(src: Path, dst: Path | None) -> Report:
             if new != text:
                 replacements[APPLE_OPTIONS] = encode(new)
 
-        # 3. CSS: font families and fixed sizes, then the body text size.
+        # 3. CSS: font families, fixed sizes and line heights, then the body text size,
+        #    its line height and the body paragraphs.
         texts = {n: decode(zf.read(n)) for n in names if ext(n) in CSS_EXTS | HTML_EXTS}
         originals = dict(texts)
 
@@ -822,6 +1138,8 @@ def normalize_epub(src: Path, dst: Path | None) -> Report:
             report.declarations += decls
             css, conv = convert_absolute_sizes(css)
             report.sizes_converted += conv
+            css, lh = remove_absolute_line_heights(css)
+            report.line_heights_removed += lh
             return css
 
         def css_sheet(css: str) -> str:
@@ -835,8 +1153,10 @@ def normalize_epub(src: Path, dst: Path | None) -> Report:
             else:
                 texts[name] = edit_css_in_html(texts[name], css_sheet, css_inline)
 
-        removed, report.body_before, report.body_after = normalize_body_size(texts)
-        report.size_decls_removed = removed
+        (report.size_decls_removed, report.sizes_rescaled,
+         report.body_before, report.body_after) = normalize_body_size(texts)
+        report.line_heights_removed += normalize_line_height(texts)
+        report.paragraphs_changed, report.first_paragraphs = normalize_paragraphs(texts)
 
         for name, text in texts.items():
             if text != originals[name]:

@@ -1,8 +1,9 @@
 # epub-normalize-fonts
 
-Makes EPUB books follow your e-reader's own font and size settings. It removes embedded
-fonts, removes the publisher's font choices, and brings the main text to your reader's
-default size. Single file, Python standard library only.
+Makes EPUB books follow your e-reader's own font, size and line spacing settings, and gives
+them consistent paragraph formatting. It removes embedded fonts and the publisher's font
+choices, brings the main text to your reader's default size, and formats paragraphs the way
+printed books do. Single file, Python standard library only.
 
 ## Install
 
@@ -53,12 +54,33 @@ Running it again on a normalized book changes nothing.
 **Font sizes**
 - Converts fixed sizes (`font-size: 11pt`, `14px`, …) to `em` (16px = 12pt = 1em). Many
   readers ignore their own size setting for fixed sizes.
-- Makes the main body text exactly the reader's default size. It works out which size most
-  of the book's text is rendered at by following the CSS cascade (`html`/`body`, classes,
-  descendant selectors, inline styles). If that differs from 100% by more than 3%, it removes
-  the `font-size` declarations responsible. Headings, footnotes, block quotes and so on keep
-  their own sizes, because only the rules that set the main text size are touched.
+- Makes the main body text exactly the reader's default size, without any `font-size` rule
+  on it. It works out which size most of the book's text is rendered at by following the CSS
+  cascade (`html`/`body`, classes, descendant selectors, inline styles), then removes the
+  `font-size` declarations that produce it.
+  - This includes rules that cancel out, like `body { font-size: 1.29em }` with
+    `p { font-size: 0.77em }`. Many reading apps override the `body` size, which would leave
+    that text at 77% of your setting.
+  - Other sizes (headings, footnotes, block quotes, …) are rescaled where needed, so they
+    keep the same size relative to the main text.
 - Expands the `font:` shorthand into separate properties so the rules above can apply.
+
+**Line height**
+- Removes the `line-height` declarations that apply to the main text, so the reader's line
+  spacing setting applies. Headings keep theirs.
+- Removes fixed line heights (`px`, `pt`, …) everywhere: they don't grow with the font size,
+  so lines overlap when you enlarge the text.
+
+**Paragraphs**
+- Gives main-text paragraphs the usual book style: a 1em first-line indent and no space
+  between paragraphs.
+- A paragraph that doesn't follow another main-text paragraph starts flush left (no indent).
+  This covers the first paragraph after a chapter heading, a scene break (`<hr/>`, `* * *`)
+  or an image.
+- Centered or right-aligned paragraphs keep their layout. So do paragraph styles that hold
+  less than 2% of the text, such as poetry, letters or epigraphs.
+- The new values are set as inline `style` attributes on each paragraph, so they win over
+  the book's stylesheets without touching rules other elements share.
 
 Everything else is copied byte-for-byte. `mimetype` stays the first, uncompressed entry.
 
@@ -67,9 +89,11 @@ obfuscation) are refused with an error; the tool cannot edit encrypted content.
 
 ## Limitations
 
-- The body size analysis ignores selectors with pseudo-classes, attribute selectors and
-  sibling combinators (`p:first-child`, `p[lang]`, `h1 + p`). Those rules are left unchanged.
-- `line-height`, margins and text alignment are not changed.
+- The analysis ignores selectors with pseudo-classes, attribute selectors and sibling
+  combinators (`p:first-child`, `p[lang]`, `h1 + p`). Those rules are left unchanged, so a
+  book that styles its first paragraphs with `h1 + p` may still get those paragraphs'
+  indent from the inline style rather than from that rule.
+- Side margins and text alignment are not changed.
 - CSS is edited with regular expressions, not a full parser. Unusual CSS (e.g. `}` inside a
   string within an `@font-face` block) may not be handled.
 
